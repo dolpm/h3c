@@ -7,10 +7,9 @@ mod tests {
     use std::{str::FromStr, time::Instant};
 
     #[test]
-    fn get_img() {
+    fn get() {
         let mut start = Instant::now();
         let mut c = Client::connect("ssl.gstatic.com").expect("failed to ocnnect to server");
-
         let resp_bytes = c
             .send(
                 url::Url::from_str(
