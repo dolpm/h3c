@@ -131,7 +131,7 @@ impl<'a> Client {
             }
 
             if conn.is_established() && h3_conn.is_none() {
-                println!("connection established with peer!");
+                // println!("connection established with peer!");
                 h3_conn = Some(quiche::h3::Connection::with_transport(
                     &mut conn, &h3_config,
                 )?);
