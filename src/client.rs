@@ -104,7 +104,7 @@ impl<'a> Client {
         // to complete the handshake
         // TODO: optimize?
         loop {
-            poll.poll(&mut events, conn.timeout()).unwrap();
+            poll.poll(&mut events, conn.timeout())?;
 
             'inner: loop {
                 if events.is_empty() {
@@ -168,11 +168,12 @@ impl<'a> Client {
         &'a mut self,
         url: url::Url,
         method: &str,
+        user_headers: Option<Vec<(&str, &str)>>,
+        body: Option<&[u8]>,
     ) -> Result<&'a [u8], Box<dyn std::error::Error>> {
         let mut sent = false;
 
-        // impl header-setting fn
-        let headers = vec![
+        let mut headers = vec![
             quiche::h3::Header::new(b":method", method.as_bytes()),
             quiche::h3::Header::new(b":scheme", url.scheme().as_bytes()),
             quiche::h3::Header::new(b":authority", url.host_str().unwrap().as_bytes()),
@@ -180,18 +181,27 @@ impl<'a> Client {
             quiche::h3::Header::new(b"user-agent", b"quiche"),
         ];
 
-        let req_start = std::time::Instant::now();
+        if let Some(user_headers) = user_headers {
+            headers.append(
+                &mut user_headers
+                    .iter()
+                    .map(|(k, v)| quiche::h3::Header::new(k.as_bytes(), v.as_bytes()))
+                    .collect::<Vec<_>>(),
+            )
+        }
+
         let mut read_upto = 0;
 
         loop {
-            self.poll
-                .poll(&mut self.events, self.conn.timeout())
-                .unwrap();
+            self.poll.poll(&mut self.events, self.conn.timeout())?;
 
             if !sent {
-                self.h3_conn
-                    .send_request(&mut self.conn, &headers, true)
-                    .unwrap();
+                let sid = self
+                    .h3_conn
+                    .send_request(&mut self.conn, &headers, body.is_none())?;
+                if let Some(body) = body {
+                    self.h3_conn.send_body(&mut self.conn, sid, body, true)?;
+                }
                 sent = true;
             }
 
@@ -238,10 +248,6 @@ impl<'a> Client {
                         }
                     }
                     Ok((_stream_id, quiche::h3::Event::Finished)) => {
-                        println!(
-                            "response received in {:?}, keeping connection live...",
-                            req_start.elapsed()
-                        );
                         return Ok(&self.ret_buf[..read_upto]);
                     }
 

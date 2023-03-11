@@ -17,6 +17,8 @@ mod tests {
                 )
                 .unwrap(),
                 "GET",
+                None,
+                None,
             )
             .unwrap();
 
