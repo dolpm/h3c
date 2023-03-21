@@ -5,7 +5,6 @@ use quiche::{h3, Connection, Error, RecvInfo};
 use ring::rand::SecureRandom;
 
 const MAX_DATAGRAM_SIZE: usize = 1472;
-const INITIAL_RESPONSE_SIZE: usize = 14720;
 
 pub struct Client {
     conn: Connection,
@@ -19,13 +18,21 @@ pub struct Client {
     pub h3_conn: h3::Connection,
 }
 
+impl Drop for Client {
+    fn drop(&mut self) {
+        if !self.conn.is_closed() {
+            self.conn.close(true, 0x00, b"kbyethx").ok();
+        }
+    }
+}
+
 impl<'a> Client {
     pub fn connect(peer: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let mut config = {
             let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION)?;
 
             config.set_application_protos(quiche::h3::APPLICATION_PROTOCOL)?;
-            config.set_max_idle_timeout(5000);
+            config.set_max_idle_timeout(20000);
             config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
             config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
             config.set_initial_max_data(10_000_000);
@@ -155,7 +162,7 @@ impl<'a> Client {
             conn,
             h3_conn: h3_conn.unwrap(),
             recv_buf,
-            ret_buf: vec![0; INITIAL_RESPONSE_SIZE],
+            ret_buf: vec![],
             socket,
             recv_info,
             dgram: [0; MAX_DATAGRAM_SIZE],
@@ -164,15 +171,92 @@ impl<'a> Client {
         })
     }
 
+    fn flush_outgoing(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            let write = match self.conn.send(&mut self.dgram) {
+                Ok((upto, _)) => upto,
+                Err(quiche::Error::Done) => {
+                    break;
+                }
+                Err(e) => {
+                    self.conn.close(false, 0x01, b"fail")?;
+                    return Err(Box::new(e));
+                }
+            };
+            if let Err(e) = self.socket.send(&self.dgram[..write]) {
+                match e.kind() {
+                    std::io::ErrorKind::WouldBlock => break,
+                    _ => return Err(Box::new(e)),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_incoming(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        loop {
+            if self.events.is_empty() {
+                self.conn.on_timeout();
+                break;
+            }
+            match self.socket.recv(&mut self.recv_buf) {
+                Ok(v) => self.conn.recv(&mut self.recv_buf[..v], self.recv_info),
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::WouldBlock => break,
+                    _ => return Err(Box::new(e)),
+                },
+            }?;
+        }
+        Ok(())
+    }
+
+    fn process_read(
+        &mut self,
+    ) -> Result<Option<std::vec::Drain<'_, u8>>, Box<dyn std::error::Error>> {
+        loop {
+            match self.h3_conn.poll(&mut self.conn) {
+                // todo: do something with headers
+                Ok((_stream_id, quiche::h3::Event::Headers { list: _, .. })) => {}
+                Ok((stream_id, quiche::h3::Event::Data)) => {
+                    while let Ok(upto) =
+                        self.h3_conn
+                            .recv_body(&mut self.conn, stream_id, &mut self.recv_buf)
+                    {
+                        self.ret_buf.extend_from_slice(&self.recv_buf[..upto]);
+                    }
+                }
+                Ok((_stream_id, quiche::h3::Event::Finished)) => {
+                    return Ok(Some(self.ret_buf.drain(..)));
+                }
+                Ok((_flow_id, quiche::h3::Event::Datagram)) => {
+                    break;
+                }
+                Ok((_goaway_id, quiche::h3::Event::GoAway)) => {
+                    break;
+                }
+                Err(quiche::h3::Error::Done) => {
+                    break;
+                }
+                Err(e) => {
+                    self.conn.close(false, 0x01, b"fail")?;
+                    return Err(Box::new(e));
+                }
+                Ok((_, quiche::h3::Event::Reset(_)))
+                | Ok((_, quiche::h3::Event::PriorityUpdate)) => {
+                    break;
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub fn send(
         &'a mut self,
         url: url::Url,
         method: &str,
         user_headers: Option<Vec<(&str, &str)>>,
         body: Option<&[u8]>,
-    ) -> Result<&'a [u8], Box<dyn std::error::Error>> {
-        let mut sent = false;
-
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let mut headers = vec![
             quiche::h3::Header::new(b":method", method.as_bytes()),
             quiche::h3::Header::new(b":scheme", url.scheme().as_bytes()),
@@ -190,103 +274,20 @@ impl<'a> Client {
             )
         }
 
-        let mut read_upto = 0;
+        let sid = self
+            .h3_conn
+            .send_request(&mut self.conn, &headers, body.is_none())?;
+        if let Some(body) = body {
+            self.h3_conn.send_body(&mut self.conn, sid, body, true)?;
+        }
 
         loop {
             self.poll.poll(&mut self.events, self.conn.timeout())?;
-
-            if !sent {
-                let sid = self
-                    .h3_conn
-                    .send_request(&mut self.conn, &headers, body.is_none())?;
-                if let Some(body) = body {
-                    self.h3_conn.send_body(&mut self.conn, sid, body, true)?;
-                }
-                sent = true;
+            self.read_incoming()?;
+            if let Some(v) = self.process_read()? {
+                return Ok(v.collect::<Vec<_>>());
             }
-
-            'inner: loop {
-                if self.events.is_empty() {
-                    self.conn.on_timeout();
-                    break 'inner;
-                }
-
-                let len = match self.socket.recv(&mut self.recv_buf) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        if e.kind() == std::io::ErrorKind::WouldBlock {
-                            break 'inner;
-                        }
-                        return Err(Box::new(e));
-                    }
-                };
-
-                let _ = self.conn.recv(&mut self.recv_buf[..len], self.recv_info);
-            }
-
-            loop {
-                match self.h3_conn.poll(&mut self.conn) {
-                    // todo: do something with headers
-                    Ok((_stream_id, quiche::h3::Event::Headers { list: _, .. })) => {}
-                    Ok((stream_id, quiche::h3::Event::Data)) => {
-                        while let Ok(upto) =
-                            self.h3_conn
-                                .recv_body(&mut self.conn, stream_id, &mut self.recv_buf)
-                        {
-                            // expand buffer?
-                            let bl = self.ret_buf.len();
-                            if read_upto + upto > bl {
-                                self.ret_buf.resize((bl + upto).max(bl * 2), 0);
-                            }
-
-                            self.recv_buf[..upto]
-                                .iter()
-                                .enumerate()
-                                .for_each(|(i, v)| self.ret_buf[read_upto + i] = *v);
-
-                            read_upto += upto;
-                        }
-                    }
-                    Ok((_stream_id, quiche::h3::Event::Finished)) => {
-                        return Ok(&self.ret_buf[..read_upto]);
-                    }
-
-                    // todo: handle these
-                    Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
-                    Ok((_goaway_id, quiche::h3::Event::GoAway)) => (),
-
-                    Err(quiche::h3::Error::Done) => {
-                        break;
-                    }
-                    Err(e) => {
-                        return Err(Box::new(e));
-                    }
-                    // all other codes --> keep polling
-                    _ => {
-                        break;
-                    }
-                }
-            }
-
-            loop {
-                let (bw, _) = match self.conn.send(&mut self.dgram) {
-                    Ok(v) => v,
-                    Err(quiche::Error::Done) => {
-                        break;
-                    }
-                    Err(e) => {
-                        self.conn.close(false, 0x1, b"fail").ok();
-                        return Err(Box::new(e));
-                    }
-                };
-
-                if let Err(e) = self.socket.send(&self.dgram[..bw]) {
-                    if e.kind() == std::io::ErrorKind::WouldBlock {
-                        break;
-                    }
-                    return Err(Box::new(e));
-                }
-            }
+            self.flush_outgoing()?;
         }
     }
 }
