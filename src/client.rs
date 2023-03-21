@@ -1,4 +1,4 @@
-use std::{net::ToSocketAddrs, str::FromStr};
+use std::{error, fmt, net::ToSocketAddrs, str::FromStr};
 
 use mio::net::UdpSocket;
 use quiche::{h3, Connection, Error, RecvInfo};
@@ -23,6 +23,41 @@ impl Drop for Client {
         if !self.conn.is_closed() {
             self.conn.close(true, 0x00, b"kbyethx").ok();
         }
+    }
+}
+
+#[derive(Debug)]
+pub enum ClientErrorType {
+    ConnectionTimeout,
+}
+
+#[derive(Debug)]
+pub struct ClientError<'a> {
+    pub error_type: ClientErrorType,
+    pub error_msg: &'a str,
+}
+
+impl<'a> error::Error for ClientError<'a> {}
+
+impl<'a> ClientError<'a> {
+    pub fn new(error_type: ClientErrorType, error_msg: &'a str) -> ClientError<'a> {
+        Self {
+            error_type,
+            error_msg,
+        }
+    }
+
+    pub fn timed_out() -> ClientError<'a> {
+        Self {
+            error_type: ClientErrorType::ConnectionTimeout,
+            error_msg: "connection timed out!",
+        }
+    }
+}
+
+impl<'a> fmt::Display for ClientError<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:#?}", self)
     }
 }
 
@@ -123,22 +158,17 @@ impl<'a> Client {
         // TODO: optimize?
         loop {
             c.poll.poll(&mut c.events, c.conn.timeout())?;
-
             c.read_incoming()?;
-
             if c.conn.is_closed() {
                 // todo make this more verbose but it'll do for now
                 return Err(Box::new(Error::StreamStopped(0)));
-            }
-
-            if c.conn.is_established() && c.h3_conn.is_none() {
+            } else if c.conn.is_established() && c.h3_conn.is_none() {
                 c.h3_conn = Some(quiche::h3::Connection::with_transport(
                     &mut c.conn,
                     &h3_config,
                 )?);
                 break;
             }
-
             c.flush_outgoing()?;
         }
 
@@ -171,7 +201,7 @@ impl<'a> Client {
         loop {
             if self.events.is_empty() {
                 self.conn.on_timeout();
-                return Err("connection timeout".into());
+                return Err(Box::new(ClientError::timed_out()));
             }
             match self.socket.recv(&mut self.recv_buf) {
                 Ok(v) => self.conn.recv(&mut self.recv_buf[..v], self.recv_info),
